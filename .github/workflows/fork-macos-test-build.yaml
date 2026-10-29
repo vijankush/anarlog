@@ -1,0 +1,73 @@
+name: Fork macOS test build
+
+# Lives only on test-build/** branches of a personal fork. Never include it in an
+# upstream pull request.
+on:
+  push:
+    branches:
+      - "test-build/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    if: ${{ github.repository != 'fastrepl/anarlog' }}
+    runs-on: macos-26
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: aarch64-apple-darwin
+      TAURI_CONF_PATH: ./src-tauri/tauri.conf.staging.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: ./.github/actions/install_desktop_deps
+        with:
+          target: macos
+      - uses: ./.github/actions/rust_install
+        with:
+          platform: macos
+      - run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/pnpm_install
+      - run: pnpm -F ui build
+      - name: Prepare sidecars
+        run: |
+          TAURI_ENV_TARGET_TRIPLE="$TARGET" cargo xtask prepare-binaries
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" "binaries/char-chrome-native-host"
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" "binaries/check-permissions"
+          ./scripts/sidecar.sh "./apps/desktop/$TAURI_CONF_PATH" "resources/cli/anarlog-cli"
+      - name: Build ad-hoc signed app
+        run: |
+          overrides="$RUNNER_TEMP/fork-test-build.json"
+          echo '{"bundle":{"createUpdaterArtifacts":false,"macOS":{"signingIdentity":"-","hardenedRuntime":false}}}' > "$overrides"
+          pnpm -F desktop tauri build --target "$TARGET" --config "$TAURI_CONF_PATH" --config "$overrides" --features devtools --bundles app --verbose
+        env:
+          CI: false
+          POSTHOG_API_KEY: phc_fork_test_build
+          VITE_APP_URL: https://anarlog.so
+          VITE_API_URL: https://api.anarlog.so
+      - name: Package DMG
+        run: |
+          shopt -s nullglob
+          apps=(apps/desktop/src-tauri/target/"$TARGET"/release/bundle/macos/*.app)
+          if [[ ${#apps[@]} -ne 1 ]]; then
+            echo "::error::Expected one app bundle, found ${#apps[@]}"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          hdiutil create -volname "Anarlog Staging" -srcfolder "${apps[0]}" -ov -format UDZO anarlog-staging-custom-chat-prompts.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anarlog-staging-custom-chat-prompts-macos-silicon
+          path: anarlog-staging-custom-chat-prompts.dmg
+          retention-days: 7
